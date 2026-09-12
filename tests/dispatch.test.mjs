@@ -14,33 +14,26 @@ function fixture(t, extra = {}) {
   fs.mkdirSync(cwd);
   const bin = path.join(dir, 'fake-worker');
   fs.writeFileSync(bin, `#!${process.execPath}
-const fs = require('node:fs');
 const args = process.argv.slice(2);
 const result = { args, cwd: process.cwd(), worker: process.env.GPT_DISPATCH_WORKER };
 const finish = () => {
   if (process.env.MOCK_MODE === 'fail') { console.error('worker failed'); process.exit(7); }
   if (process.env.MOCK_MODE === 'empty') process.exit(0);
   const text = JSON.stringify(result);
-  const i = args.indexOf('--output-last-message');
-  if (i >= 0) fs.writeFileSync(args[i + 1], text);
   console.log(text);
 };
 if (process.env.MOCK_MODE === 'hang') {
   console.log('worker ready');
   setInterval(() => {}, 1000);
-} else if (args[0] === 'exec') {
-  result.prompt = '';
-  process.stdin.on('data', d => result.prompt += d);
-  process.stdin.on('end', finish);
 } else finish();
 `, { mode: 0o755 });
-  const env = { ...process.env, DISPATCH_HOME: path.join(dir, 'state'), CODEX_BIN: bin, KIMI_BIN: bin, ...extra };
+  const env = { ...process.env, DISPATCH_HOME: path.join(dir, 'state'), KIMI_BIN: bin, ...extra };
   delete env.GPT_DISPATCH_WORKER;
   const prompt = path.join(dir, 'order.md');
   fs.writeFileSync(prompt, 'Inspect files only. Literal shell syntax: $(touch SHOULD_NOT_EXIST); "quotes".');
   const call = (args) => spawnSync(process.execPath, [runner, ...args], { cwd, env, encoding: 'utf8', timeout: 20000 });
   const start = (args = []) => {
-    const out = call(['start', '--worker', 'codex', '--prompt-file', prompt, ...args]);
+    const out = call(['start', '--prompt-file', prompt, ...args]);
     assert.equal(out.status, 0, out.stderr);
     return JSON.parse(out.stdout);
   };
@@ -52,19 +45,18 @@ if (process.env.MOCK_MODE === 'hang') {
   return { dir, cwd, env, prompt, call, start };
 }
 
-test('Codex background job preserves arguments, stdin, cwd and final report', (t) => {
+test('default Kimi background job preserves arguments, cwd and final report', (t) => {
   const f = fixture(t);
-  const job = f.start(['--sandbox', 'workspace-write', '--model', 'custom-gpt', '--effort', 'high']);
+  const job = f.start(['--model', 'custom-kimi']);
+  assert.equal(job.worker, 'kimi');
   const done = f.call(['wait', job.id, '--poll', '0.02', '--timeout', '5']);
   assert.equal(done.status, 0, done.stderr);
   assert.equal(JSON.parse(done.stdout).status, 'succeeded');
   const report = JSON.parse(f.call(['result', job.id]).stdout);
   assert.equal(report.cwd, fs.realpathSync(f.cwd));
   assert.equal(report.worker, '1');
-  assert.ok(report.args.includes('custom-gpt'));
-  assert.ok(report.args.includes('workspace-write'));
-  assert.ok(report.args.includes('model_reasoning_effort="high"'));
-  assert.match(report.prompt, /\$\(touch SHOULD_NOT_EXIST\)/);
+  assert.deepEqual(report.args.slice(2), ['--model', 'custom-kimi']);
+  assert.match(report.args[1], /\$\(touch SHOULD_NOT_EXIST\)/);
   assert.equal(fs.existsSync(path.join(f.cwd, 'SHOULD_NOT_EXIST')), false);
   assert.equal(fs.readdirSync(path.join(f.env.DISPATCH_HOME, 'locks')).length, 0);
 });
@@ -137,7 +129,37 @@ test('retry targets an exact job and carries original order and corrections', (t
   const job = JSON.parse(next.stdout);
   assert.equal(job.retryOf, first.id);
   assert.equal(f.call(['wait', job.id, '--poll', '0.02', '--timeout', '5']).status, 0);
-  assert.match(JSON.parse(f.call(['result', job.id]).stdout).prompt, /Include the missing command output/);
+  assert.match(JSON.parse(f.call(['result', job.id]).stdout).args[1], /Include the missing command output/);
+});
+
+test('GPT dispatch and retired Codex flags are rejected before any job is created', (t) => {
+  const f = fixture(t);
+  for (const worker of ['codex', 'gpt', 'astra']) {
+    const out = f.call(['start', '--worker', worker, '--prompt-file', f.prompt]);
+    assert.equal(out.status, 1);
+    assert.match(out.stderr, /Only Kimi execution is supported/);
+  }
+  for (const args of [['--effort', 'high'], ['--sandbox', 'workspace-write']]) {
+    const out = f.call(['start', '--prompt-file', f.prompt, ...args]);
+    assert.equal(out.status, 1);
+    assert.match(out.stderr, /Unknown or duplicate option/);
+  }
+  assert.equal(fs.existsSync(path.join(f.env.DISPATCH_HOME, 'jobs')), false);
+});
+
+test('legacy Codex reports remain readable but cannot be retried or executed', (t) => {
+  const f = fixture(t);
+  const job = f.start();
+  assert.equal(f.call(['wait', job.id, '--poll', '0.02', '--timeout', '5']).status, 0);
+  const file = path.join(f.env.DISPATCH_HOME, 'jobs', job.id, 'job.json');
+  const legacy = { ...JSON.parse(fs.readFileSync(file, 'utf8')), worker: 'codex' };
+  fs.writeFileSync(file, JSON.stringify(legacy));
+  assert.equal(f.call(['result', job.id]).status, 0);
+  const retry = f.call(['retry', job.id, '--prompt-file', f.prompt]);
+  assert.equal(retry.status, 1);
+  assert.match(retry.stderr, /Only Kimi execution is supported/);
+  assert.equal(f.call(['_run', job.id]).status, 1);
+  assert.equal(fs.readdirSync(path.join(f.env.DISPATCH_HOME, 'jobs')).length, 1);
 });
 
 test('unknown jobs and invalid inputs fail explicitly', (t) => {
@@ -145,6 +167,6 @@ test('unknown jobs and invalid inputs fail explicitly', (t) => {
   assert.equal(f.call(['status', '00000000-0000-0000-0000-000000000000']).status, 1);
   assert.equal(f.call(['status', '../bad']).status, 1);
   assert.equal(f.call(['start', '--worker', 'kimi', '--sandbox', 'read-only', '--prompt-file', f.prompt]).status, 1);
-  assert.equal(f.call(['start', '--worker', 'codex', '--timeout', 'NaN', '--prompt-file', f.prompt]).status, 1);
-  assert.equal(f.call(['start', '--worker', 'codex', '--prompt-file', f.prompt, '--unknown', 'x']).status, 1);
+  assert.equal(f.call(['start', '--timeout', 'NaN', '--prompt-file', f.prompt]).status, 1);
+  assert.equal(f.call(['start', '--prompt-file', f.prompt, '--unknown', 'x']).status, 1);
 });

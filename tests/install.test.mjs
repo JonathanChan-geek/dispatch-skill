@@ -17,12 +17,16 @@ test('installer bundles scripts with skill and preserves previous installation i
   assert.equal(one.status, 0, one.stderr);
   assert.ok(fs.existsSync(path.join(target, 'SKILL.md')));
   assert.ok(fs.existsSync(path.join(target, 'scripts', 'dispatch.mjs')));
+  assert.ok(fs.existsSync(path.join(target, 'scripts', 'wait.mjs')));
   fs.writeFileSync(path.join(target, 'custom.txt'), 'preserve this');
+  fs.writeFileSync(path.join(target, 'scripts', 'codex-wait.mjs'), '// legacy');
   const two = install();
   assert.equal(two.status, 0, two.stderr);
   const receipt = JSON.parse(two.stdout);
   assert.equal(fs.readFileSync(path.join(receipt.backup, 'custom.txt'), 'utf8'), 'preserve this');
   assert.equal(fs.existsSync(path.join(target, 'custom.txt')), false);
+  assert.equal(fs.existsSync(path.join(target, 'scripts', 'codex-wait.mjs')), false);
+  assert.ok(fs.existsSync(path.join(receipt.backup, 'scripts', 'codex-wait.mjs')));
   assert.equal(receipt.globalRulesChanged, false);
 });
 

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// Compatibility name; accepts new dispatch UUIDs for either worker.
+// Wait for a Kimi execution job, then print its report for Astra to review.
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 const [id, poll = '2', timeout = '300'] = process.argv.slice(2);
 if (!id) {
-  console.error('Usage: node codex-wait.mjs JOB [POLL_SECONDS] [TIMEOUT_SECONDS]');
+  console.error('Usage: node wait.mjs JOB [POLL_SECONDS] [TIMEOUT_SECONDS]');
   process.exit(2);
 }
 const runner = fileURLToPath(new URL('./dispatch.mjs', import.meta.url));

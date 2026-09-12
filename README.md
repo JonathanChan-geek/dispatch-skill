@@ -1,24 +1,30 @@
 # dispatch-skill
 
-**GPT/Codex 主控，Codex + Kimi 施工。** 保留原派单工作流的分级、工单、worktree 和验收机制，移除 Claude Code 插件、硬编码用户目录、固定模型和插件补丁依赖。
+**GPT Astra 负责规划与验收，Kimi Code 负责快速执行简单、明确的任务。** 没有 GPT 派单给 GPT，也没有按前端/后端划分模型的路由。
 
-GPT 指当前使用的主控模型，通常运行在 **Codex App / Codex CLI**。Codex worker 是单独启动的 `codex exec` 进程；普通 ChatGPT 网页没有本地 CLI 时，不能直接运行这些脚本。
+Astra 在当前主控会话中思考和决策，通常使用 **Codex App / Codex CLI** 作为工具环境。脚本只启动 Kimi，不启动额外的 GPT/Codex 进程，也不自动切换主控模型或修改其配置。
+
+```text
+用户目标 → Astra 分析、定方案、拆步骤 → Kimi 执行 → Astra 验收
+                    ↑                               ↓
+                    └────────── 决策与纠偏 ──────────┘
+```
 
 ## 快速开始
 
-需要 **Node.js >= 20、Git**，以及已安装并登录的 **Codex CLI / Kimi CLI**（只用哪家就装哪家）。无需 npm 依赖，无需在本仓库填 API key。后台运行器支持 macOS、Linux、WSL；Windows 用户在 WSL 内安装和运行 CLI。
+需要 **Node.js >= 20、Git**，以及已安装并登录的 **Kimi Code CLI**。主控使用 Astra 会话并具备本地命令执行能力。无需 npm 依赖，无需在本仓库填 API key。后台运行器支持 macOS、Linux、WSL；Windows 用户在 WSL 内安装和运行 CLI。
 
 ```bash
-gh repo clone JonathanChan-geek/dispatch-skill
+git clone https://github.com/JonathanChan-geek/dispatch-skill.git
 cd dispatch-skill
 node install.mjs
 ```
 
 安装到 `~/.agents/skills/dispatch/`，skill 与脚本一起部署。已有安装先备份到 `~/.local/state/gpt-dispatch/install-backups/`。安装器不修改全局 `AGENTS.md`、模型/认证配置或旧 `.claude` 文件。自定义位置使用 `node install.mjs --target /absolute/path/to/dispatch`。
 
-在新的 Codex 会话中使用：
+在主控环境选择 Astra，并在新会话中使用：
 
-> 使用 $dispatch。先读项目 AGENTS.md 和代码，由当前 GPT 拆单：独立后端任务给 Codex，文档/机械任务给 Kimi，前端自己处理；最后核对 diff、运行必要验证并验收。
+> 使用 $dispatch。你负责规划和验收，把任务拆成 Kimi 能直接执行的小步骤。Kimi 遇到不确定性先反馈给你决策，不要再派单给另一个 GPT。
 
 改工作流：**修改本仓库 → 验证 → 重新执行 `node install.mjs`**。不要只改安装副本。
 
@@ -26,12 +32,12 @@ node install.mjs
 
 | 角色 | 职责 |
 | --- | --- |
-| GPT 主控 | 架构、拆单、接口冻结、监工、验收、提交合并；前端/UI 与连续决策 |
-| Codex worker | 后端、复杂逻辑、长程排障、大重构 |
-| Kimi worker | 测试补写、文档同步、机械修改、读码报告 |
-| 独立复核 | 按需由未参与实现的 worker 只读检查高风险 diff |
+| GPT Astra | 理解目标、分析问题、确定架构/接口、拆步骤、判断阻塞原因、验收与纠偏 |
+| Kimi Code | 按已经定好的具体步骤改文件、同步文档、实现小逻辑、搬运数据、运行验证 |
 
-L0：小修或紧密耦合工作直接做。L1：独立单域任务在干净主树派单。L2：并行或高风险派单先冻结 gates，再建互不重叠的 lane。项目 `AGENTS.md` 可覆盖默认路由。主控和 worker 均不强制具体模型，worker 默认读取自己的 CLI 配置。
+这里对 Kimi 的定位是**快、做简单明确的具体执行**，不是复杂方案设计者。简单任务直接给 Kimi；复杂任务由 Astra 先想清楚，再拆成小步骤。如果还需要执行者选择架构或发明接口，说明 Astra 还没有拆完。
+
+默认一个简单工单即可，不为了派单增加流程。只有真正独立且并行有收益的任务，才启动多个 Kimi 进程并使用互不重叠的 worktree；共享状态与连续决策由 Astra 串行推进。需要冻结契约或隔离修改时才启用 gates。遇到歧义，Kimi 把具体阻塞点交回 Astra。
 
 ## 手动派单
 
@@ -42,12 +48,8 @@ SCRIPTS="$HOME/.agents/skills/dispatch/scripts"
 PROJECT="/absolute/path/to/your-project"
 ORDER="/absolute/path/outside-project/order.md"
 
-# Codex 写任务；只读任务省略 --sandbox 或指定 read-only
-node "$SCRIPTS/dispatch.mjs" start --worker codex --cwd "$PROJECT" \
-  --prompt-file "$ORDER" --sandbox workspace-write
-
-# Kimi 任务；同一目录上一单结束后才能再派
-node "$SCRIPTS/dispatch.mjs" start --worker kimi --cwd "$PROJECT" \
+# 默认且只能启动 Kimi；同一目录上一单结束后才能再派
+node "$SCRIPTS/dispatch.mjs" start --cwd "$PROJECT" \
   --prompt-file "$ORDER"
 ```
 
@@ -65,15 +67,15 @@ node "$SCRIPTS/dispatch.mjs" cancel "$JOB_ID"
 - `status` 不带 ID 时列出所有作业。成功、失败、取消、监工进程中断分别报告；未知 ID 报错，不冒充已完成。
 - `wait --timeout 300` 只等 300 秒，不会取消后台作业。需要执行总时限，在 `start` 指定 `--timeout 900`；默认不强制终止。
 - `cancel` 停止该任务的 worker 进程组；CLI 正常结束后也清理其遗留子进程，不操作其他作业。
-- `retry` 以**指定 job ID**为依据，新建会话并带入原工单、上次报告和缺陷清单；不是完整会话续接。保留工作目录已有改动，沿用 worker、模型和权限参数，不猜测“最近一次会话”。
+- `retry` 以**指定 Kimi job ID**为依据，新建会话并带入原工单、上次报告和 Astra 的具体修正步骤；不是完整会话续接。保留工作目录已有改动，沿用 Kimi 模型配置，不猜测“最近一次会话”。
 - `succeeded` 仅代表 CLI 退出码为 0 且存在非空报告；**不代表主控验收通过**。`wait`/`result` 对失败作业返回非零。
-- Codex 默认只读，写任务显式设置 `workspace-write`；Kimi 不支持这里的 `--sandbox`/`--effort`，也不会自动加 `--auto`/`-y`。
+- 执行器只有 Kimi，显式 `--worker kimi` 仍可用，`--worker codex` 会拒绝。没有 `--sandbox`/`--effort` 参数，也不会自动加 `--auto`/`-y`；工单约束不能当作系统级权限隔离。
 
-可选：Codex 设置 `--effort high` 或 `--effort xhigh`；两家均可按用户明确选择设置 `--model NAME`。不传模型就沿用各 CLI 配置。
+Kimi 默认沿用其 CLI 中配置的模型。只有用户明确指定执行模型时才传 `--model NAME`，它不选择或切换主控 Astra。
 
-## L2 并行与验收
+## 按需隔离与验收
 
-在目标项目根目录操作，先写好并提交 `docs/gates/<slice>.md`，每条验收包含精确命令和预期结果：
+只有确需隔离或并行的任务才走此流程。由 Astra 先定好每单的具体步骤，在目标项目根目录写好并提交 `docs/gates/<slice>.md`，每条验收包含精确命令和预期结果：
 
 ```bash
 cd "$PROJECT"
@@ -108,10 +110,10 @@ node "$SCRIPTS/mutate.mjs" --spec /absolute/path/mutations.json
 ## 文件地图
 
 ```text
-skills/dispatch/SKILL.md                GPT 主控流程
-skills/dispatch/references/work-order.md 自包含工单模板
-scripts/dispatch.mjs                    CLI 后台派单、JSON 台账、等待、返工、取消
-scripts/codex-wait.mjs                  等待并打印报告的兼容入口
+skills/dispatch/SKILL.md                Astra 规划、Kimi 执行的工作流
+skills/dispatch/references/work-order.md Astra 给 Kimi 的具体执行单
+scripts/dispatch.mjs                    Kimi 后台执行、JSON 台账、等待、返工、取消
+scripts/wait.mjs                        等待任务并打印报告供 Astra 验收
 scripts/lane.mjs                        worktree 创建、范围审计和清理
 scripts/mutate.mjs                      基线检查、变异测试和恢复
 global/AGENTS.md.section.md             可选的全局规则片段，不自动合并
@@ -121,15 +123,15 @@ tests/                                 临时 Git 仓库及 mock CLI 集成测�
 
 任务台账默认在 `~/.local/state/gpt-dispatch/jobs/<id>/`，包含 `job.json`、`prompt.md`、`stdout.log`、`stderr.log`、`report.md` 和 `supervisor.log`。这些文件不进入项目 Git；可能包含工单和模型输出，发布仓库时无需打包它们。
 
-`DISPATCH_HOME` 可覆盖状态根目录，派单与查状态必须使用相同值。`CODEX_BIN` / `KIMI_BIN` 可指定可执行文件绝对路径，不接受带参数的 shell 命令。状态中的 `idleSeconds` 仅用于观察，长时间没有输出不会自动触发取消。
+`DISPATCH_HOME` 可覆盖状态根目录，派单与查状态必须使用相同值。`KIMI_BIN` 可指定 Kimi 可执行文件绝对路径，不接受带参数的 shell 命令。状态中的 `idleSeconds` 仅用于观察，长时间没有输出不会自动触发取消。
 
-## 从 Claude Code 版迁移
+## 从旧版迁移
 
-1. 主控由 Claude 改为当前 GPT/Codex，规则来源改为 canonical `AGENTS.md`。
-2. `codex-companion task/status/result` 改为本仓库 `dispatch.mjs`，不再需要插件路径、`CLAUDE_PLUGIN_DATA` 或 sandbox 补丁。
-3. `--resume-last` / Kimi `-c` 改为 `retry <明确的 job ID>`；老插件的 job ID 不导入新台账。
-4. `codex-wait.mjs` 名称保留，但只接受新版 dispatch UUID，Codex/Kimi 都能等。
-5. 重新安装即可更新 skill 和脚本，旧 `.claude` 文件保留不动；原版可从 Git 历史查看。
+1. v3 只保留两个角色：当前 GPT Astra 规划与验收，Kimi 执行具体步骤。删除原来的 Codex worker 路由和默认跨模型评审。
+2. `start --worker kimi` 可简写成 `start`；Codex worker 参数、`CODEX_BIN`、`--sandbox` 和 `--effort` 已移除，不会静默改派。
+3. 等待脚本从 `codex-wait.mjs` 改名为 `wait.mjs`。重新执行安装器会更新整个安装目录并备份旧版。
+4. 旧台账仍可查询与读取报告，历史 Codex job 不允许重新执行或 `retry`；Kimi 的返工必须指定 job ID。
+5. 不需要 Claude Code 插件或相关环境变量，不自动修改旧 `.claude` 文件和任何模型/认证配置。原版本保留在 Git 历史中。
 
 ## 验证与依据
 
@@ -138,6 +140,6 @@ npm run check
 npm test
 ```
 
-测试使用临时 Git 仓库和 mock CLI，不消耗模型额度。覆盖后台状态、原始参数传递、失败/取消/超时、目录互斥、返工、lane 审计与清理、变异结果和安装备份。真实模型可用性仍取决于本机 CLI 登录与配置。
+测试使用临时 Git 仓库和 mock CLI，不消耗模型额度。覆盖 Kimi 默认执行、拒绝 GPT 派单、旧任务迁移、原始参数传递、失败/取消/超时、目录互斥、返工、lane 审计与清理、变异结果和安装备份。真实模型可用性仍取决于本机 Kimi CLI 登录与配置。
 
-CLI 接口以本机 `codex exec --help`、`kimi --help` 为准，参考 [Codex 非交互模式](https://developers.openai.com/codex/noninteractive) 和 [Kimi Code 文档](https://moonshotai.github.io/kimi-code/)。原工作流的工单和 gates 思路来源记录保留在仓库初始提交中。
+Kimi CLI 接口以本机 `kimi --help` 为准，参考 [Kimi Code 文档](https://moonshotai.github.io/kimi-code/)。原工作流的工单和 gates 思路来源记录保留在仓库初始提交中。
