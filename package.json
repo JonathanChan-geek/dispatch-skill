@@ -1,0 +1,9 @@
+{
+  "name": "gpt-dispatch-skill",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "GPT-led dispatch workflow for Codex and Kimi CLI workers",
+  "engines": { "node": ">=20" },
+  "scripts": { "test": "node --test tests/*.test.mjs", "check": "node scripts/check.mjs" }
+}

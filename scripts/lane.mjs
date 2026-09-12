@@ -1,160 +1,204 @@
 #!/usr/bin/env node
-// lane.mjs — worktree lane 管理 + 触碰集对账(派单纪律的强制力层)
-//
-// 用法(在目标仓库任意目录下执行):
-//   node lane.mjs new <slice> <file-or-dir>... [--base <ref>] [--protect <path>]...
-//       建 worktree .lanes/<slice>(分支 lane/<slice>),声明允许触碰的文件集,写 manifest
-//   node lane.mjs audit <slice>
-//       对账:HEAD 未动(worker 禁 commit)+ 改动全在声明集内 + 保护路径未碰。FAIL 时 exit 1
-//   node lane.mjs list
-//   node lane.mjs drop <slice>
-//       删 worktree + lane 分支 + manifest(验收合并后、或弃 lane 时用)
-//
-// 设计约定:
-//   - worktree 放在 <repo>/.lanes/ 下,自动写入 .git/info/exclude,不污染 tracked .gitignore
-//   - 声明集条目:目录以 / 结尾或本身是目录 → 前缀匹配;含 * → 简单 glob;否则精确匹配
-//   - docs/gates/ 永远是保护路径(worker 改验收门 = 自动 FAIL)
-//   - 合并不归本脚本:audit PASS 后由监工在 lane 目录逐行读 diff、自己 commit 到 lane 分支再 merge
+// new <slice> <file-or-dir>... [--base <ref>] [--protect <path>]...
+// audit <slice> | list | drop <slice> [--force]
+// Scope entries are normalized repository-relative paths, never globs.
 
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
 function git(args, cwd) {
-  return execFileSync('git', args, { cwd, encoding: 'utf8', windowsHide: true }).trim();
+  return execFileSync('git', args, { cwd, encoding: 'utf8', windowsHide: true });
 }
 
-function die(msg) { console.error(`[lane] FAIL: ${msg}`); process.exit(1); }
+function fail(message) { throw new Error(message); }
 
-const argv = process.argv.slice(2);
-const cmd = argv.shift();
-if (!cmd || !['new', 'audit', 'list', 'drop'].includes(cmd)) {
-  console.error('用法: node lane.mjs new|audit|list|drop ...(见文件头注释)');
-  process.exit(2);
-}
-
-// 主仓库根:不能用 --show-toplevel(在 worktree 内会返回 worktree 自身路径),
-// 用 --git-common-dir 定位主 .git 再取其父目录
-const gitCommonDir = path.resolve(process.cwd(), git(['rev-parse', '--git-common-dir'], process.cwd()));
-const root = path.dirname(gitCommonDir);
-const lanesDir = path.join(root, '.lanes');
-const manifestPath = (slice) => path.join(lanesDir, `${slice}.manifest.json`);
-const wtPath = (slice) => path.join(lanesDir, slice);
-
-function ensureExcluded() {
-  const excl = path.join(gitCommonDir, 'info', 'exclude');
-  fs.mkdirSync(path.dirname(excl), { recursive: true });
-  const cur = fs.existsSync(excl) ? fs.readFileSync(excl, 'utf8') : '';
-  if (!cur.split(/\r?\n/).includes('.lanes/')) {
-    fs.writeFileSync(excl, cur + (cur.endsWith('\n') || cur === '' ? '' : '\n') + '.lanes/\n');
+function validateSlice(slice) {
+  if (typeof slice !== 'string' || !/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(slice)) {
+    fail('slice must start with a letter, digit or underscore and contain only A-Za-z0-9_.-');
   }
+  return slice;
 }
 
-function loadManifest(slice) {
-  if (!fs.existsSync(manifestPath(slice))) die(`找不到 manifest: ${manifestPath(slice)}`);
-  return JSON.parse(fs.readFileSync(manifestPath(slice), 'utf8'));
+function normalizeEntry(entry) {
+  if (typeof entry !== 'string' || !entry || /[\0\r\n*?\[\]{}]/.test(entry)) {
+    fail('scope/protect entries must be nonempty paths; glob patterns are not supported');
+  }
+  const portable = entry.replace(/\\/g, '/');
+  if (path.posix.isAbsolute(portable) || /^[A-Za-z]:/.test(portable)) fail(`absolute path is not allowed: ${entry}`);
+  const normalized = path.posix.normalize(portable).replace(/\/$/, '');
+  if (!normalized || normalized === '.' || normalized === '..' || normalized.startsWith('../')) {
+    fail(`path escapes repository or names its root: ${entry}`);
+  }
+  if (normalized.split('/').some((part) => part.toLowerCase() === '.git')) fail(`Git metadata is not writable: ${entry}`);
+  return normalized;
 }
 
-// 声明集匹配:dir/ 前缀 | *glob | 精确
-function makeMatcher(entries) {
-  const rules = entries.map((e) => {
-    const n = e.replace(/\\/g, '/').replace(/^\.\//, '');
-    if (n.includes('*')) {
-      const re = new RegExp('^' + n.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('[^]*') + '$');
-      return (p) => re.test(p);
+// Ancestor matching also handles a directory declared without a trailing slash.
+const contains = (entry, file) => file === entry || file.startsWith(`${entry}/`);
+const overlaps = (a, b) => contains(a, b) || contains(b, a);
+const matches = (entries, file) => entries.some((entry) => contains(entry, file));
+
+function statusPaths(wt, includeIgnored = false) {
+  const args = ['status', '--porcelain=v1', '-z', '--untracked-files=all'];
+  if (includeIgnored) args.push('--ignored');
+  const records = git(args, wt).split('\0');
+  const paths = [];
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i];
+    if (!record) continue;
+    if (record.length < 4 || record[2] !== ' ') fail('invalid porcelain status record');
+    paths.push(record.slice(3));
+    // In -z format a rename/copy is destination NUL source NUL, without quoting.
+    if (/[RC]/.test(record.slice(0, 2))) {
+      if (!records[i + 1]) fail('missing rename/copy source in porcelain status');
+      paths.push(records[++i]);
     }
-    if (n.endsWith('/')) return (p) => p.startsWith(n);
-    return (p) => p === n || p.startsWith(n + '/'); // 允许把目录写成不带斜杠
-  });
-  return (p) => rules.some((r) => r(p));
+  }
+  return paths;
 }
 
-function changedFiles(wt) {
-  const out = execFileSync('git', ['status', '--porcelain=v1', '-uall'], { cwd: wt, encoding: 'utf8', windowsHide: true });
-  return out.split(/\r?\n/).filter(Boolean).map((line) => {
-    let p = line.slice(3);
-    if (p.includes(' -> ')) p = p.split(' -> ')[1]; // rename 取新路径
-    return p.replace(/^"|"$/g, '').replace(/\\/g, '/');
-  });
+function noSymlinks(root, relative) {
+  let current = root;
+  for (const part of relative.split('/')) {
+    current = path.join(current, part);
+    try {
+      if (fs.lstatSync(current).isSymbolicLink()) fail(`symlink path is not allowed: ${current}`);
+    } catch (error) {
+      if (error.code === 'ENOENT') break;
+      throw error;
+    }
+  }
 }
 
-if (cmd === 'new') {
-  const slice = argv.shift();
-  if (!slice || !/^[\w][\w.-]*$/.test(slice)) die('slice 名必须是 [A-Za-z0-9_.-]+');
+function main() {
+  const [cmd, ...argv] = process.argv.slice(2);
+  if (!['new', 'audit', 'list', 'drop'].includes(cmd)) fail('usage: lane.mjs new|audit|list|drop');
+  const slice = cmd === 'list' ? undefined : validateSlice(argv.shift());
   let base = 'HEAD';
+  let force = false;
   const files = [];
-  const protect = ['docs/gates/'];
-  while (argv.length) {
-    const a = argv.shift();
-    if (a === '--base') base = argv.shift();
-    else if (a === '--protect') protect.push(argv.shift().replace(/\\/g, '/'));
-    else files.push(a.replace(/\\/g, '/'));
+  const protect = ['docs/gates', '.lanes'];
+  if (cmd === 'new') {
+    while (argv.length) {
+      const arg = argv.shift();
+      if (arg === '--base' || arg === '--protect') {
+        const value = argv.shift();
+        if (!value || value.startsWith('-')) fail(`missing value for ${arg}`);
+        if (arg === '--base') base = value;
+        else protect.push(normalizeEntry(value));
+      } else {
+        if (arg.startsWith('-')) fail(`unknown option: ${arg}`);
+        files.push(normalizeEntry(arg));
+      }
+    }
+    if (!files.length) fail('declare at least one writable file or directory');
+  } else if (cmd === 'drop' && argv.length === 1 && argv[0] === '--force') {
+    force = true;
+  } else if (argv.length) {
+    fail(`unexpected arguments for ${cmd}: ${argv.join(' ')}`);
   }
-  if (!files.length) die('必须声明至少一个允许触碰的文件/目录');
-  if (fs.existsSync(wtPath(slice)) || fs.existsSync(manifestPath(slice))) die(`lane "${slice}" 已存在`);
 
-  // 派活前工作树必须干净(与 mutate.mjs 同源纪律)
-  if (git(['status', '--porcelain'], root)) die('主工作树不干净,先提交或 stash 再开 lane');
+  const cwd = process.cwd();
+  const gitCommonDir = path.resolve(cwd, git(['rev-parse', '--git-common-dir'], cwd).trim());
+  const firstWorktree = git(['worktree', 'list', '--porcelain', '-z'], cwd).split('\0')[0];
+  if (!firstWorktree.startsWith('worktree ')) fail('cannot locate main worktree');
+  const root = firstWorktree.slice('worktree '.length);
+  if (git(['rev-parse', '--is-bare-repository'], root).trim() === 'true') fail('bare repositories are not supported');
+  noSymlinks(root, '.lanes');
+  const lanesDir = path.join(root, '.lanes');
+  const manifestPath = (id) => path.join(lanesDir, `${validateSlice(id)}.manifest.json`);
+  const wtPath = (id) => path.join(lanesDir, validateSlice(id));
 
-  ensureExcluded();
-  fs.mkdirSync(lanesDir, { recursive: true });
-  const baseSha = git(['rev-parse', base], root);
-  git(['worktree', 'add', '-b', `lane/${slice}`, wtPath(slice), baseSha], root);
-  const manifest = { slice, base: baseSha, branch: `lane/${slice}`, files, protect, createdAt: new Date().toISOString() };
-  fs.writeFileSync(manifestPath(slice), JSON.stringify(manifest, null, 2));
-  console.log(`[lane] OK: ${wtPath(slice)}`);
-  console.log(`[lane] 分支 lane/${slice} @ ${baseSha.slice(0, 10)}`);
-  console.log(`[lane] 触碰集: ${files.join(', ')}`);
-  console.log(`[lane] 保护路径: ${protect.join(', ')}`);
-}
-
-if (cmd === 'audit') {
-  const slice = argv.shift();
-  const m = loadManifest(slice);
-  const wt = wtPath(slice);
-  if (!fs.existsSync(wt)) die(`worktree 不存在: ${wt}`);
-
-  const problems = [];
-  const head = git(['rev-parse', 'HEAD'], wt);
-  if (head !== m.base) problems.push(`HEAD 被移动(worker 疑似 commit 过): ${m.base.slice(0, 10)} → ${head.slice(0, 10)}`);
-
-  const changed = changedFiles(wt);
-  const inScope = makeMatcher(m.files);
-  const isProtected = makeMatcher(m.protect || []);
-  const outOfScope = changed.filter((p) => !inScope(p));
-  const touchedProtected = changed.filter((p) => isProtected(p));
-
-  if (touchedProtected.length) problems.push(`碰了保护路径(自动 FAIL): ${touchedProtected.join(', ')}`);
-  if (outOfScope.length) problems.push(`声明集外的改动: ${outOfScope.join(', ')}`);
-
-  console.log(`[lane] audit "${slice}" — 改动 ${changed.length} 个文件:`);
-  for (const p of changed) console.log(`  ${outOfScope.includes(p) ? '✗' : '✓'} ${p}`);
-  if (problems.length) {
-    for (const p of problems) console.error(`[lane] FAIL: ${p}`);
-    process.exit(1);
+  function loadManifest(id) {
+    noSymlinks(root, `.lanes/${validateSlice(id)}.manifest.json`);
+    const m = JSON.parse(fs.readFileSync(manifestPath(id), 'utf8'));
+    validateSlice(m.slice);
+    if (m.slice !== id || m.branch !== `lane/${id}` || !/^[a-f0-9]{40,64}$/.test(m.base)
+      || !Array.isArray(m.files) || !m.files.length || (m.protect !== undefined && !Array.isArray(m.protect))) {
+      fail(`invalid manifest: ${id}`);
+    }
+    m.files = m.files.map(normalizeEntry);
+    m.protect = [...new Set(['docs/gates', '.lanes', ...(m.protect ?? []).map(normalizeEntry)])];
+    return m;
   }
-  console.log('[lane] PASS: HEAD 未动,改动全部在声明集内,保护路径未碰');
-}
 
-if (cmd === 'list') {
-  if (!fs.existsSync(lanesDir)) { console.log('[lane] 无活动 lane'); process.exit(0); }
-  const ms = fs.readdirSync(lanesDir).filter((f) => f.endsWith('.manifest.json'));
-  if (!ms.length) { console.log('[lane] 无活动 lane'); process.exit(0); }
-  for (const f of ms) {
-    const m = JSON.parse(fs.readFileSync(path.join(lanesDir, f), 'utf8'));
-    console.log(`${m.slice}  @${m.base.slice(0, 10)}  ${m.createdAt}  [${m.files.join(', ')}]`);
+  function manifests() {
+    if (!fs.existsSync(lanesDir)) return [];
+    return fs.readdirSync(lanesDir).filter((name) => name.endsWith('.manifest.json'))
+      .map((name) => loadManifest(name.slice(0, -'.manifest.json'.length)));
+  }
+
+  if (cmd === 'new') {
+    for (const file of files) {
+      noSymlinks(root, file);
+      if (protect.some((entry) => overlaps(entry, file))) fail(`writable scope intersects protected path: ${file}`);
+    }
+    if (fs.existsSync(wtPath(slice)) || fs.existsSync(manifestPath(slice))) fail(`lane already exists: ${slice}`);
+    for (const m of manifests()) {
+      if (files.some((file) => m.files.some((entry) => overlaps(entry, file)))) fail(`scope overlaps active lane: ${m.slice}`);
+    }
+    if (statusPaths(root).length) fail('main worktree is not clean');
+    const baseSha = git(['rev-parse', '--verify', '--end-of-options', `${base}^{commit}`], root).trim();
+    const excl = path.join(gitCommonDir, 'info', 'exclude');
+    fs.mkdirSync(path.dirname(excl), { recursive: true });
+    const cur = fs.existsSync(excl) ? fs.readFileSync(excl, 'utf8') : '';
+    if (!cur.split(/\r?\n/).includes('.lanes/')) {
+      fs.writeFileSync(excl, cur + (cur.endsWith('\n') || cur === '' ? '' : '\n') + '.lanes/\n');
+    }
+    fs.mkdirSync(lanesDir, { recursive: true });
+    git(['worktree', 'add', '-b', `lane/${slice}`, wtPath(slice), baseSha], root);
+    const manifest = { slice, base: baseSha, branch: `lane/${slice}`, files, protect, createdAt: new Date().toISOString() };
+    fs.writeFileSync(manifestPath(slice), JSON.stringify(manifest, null, 2), { flag: 'wx' });
+    console.log(`[lane] OK: ${wtPath(slice)}\n[lane] branch ${manifest.branch} @ ${baseSha.slice(0, 10)}`);
+    console.log(`[lane] scope: ${files.join(', ')}\n[lane] protected: ${protect.join(', ')}`);
+  }
+
+  if (cmd === 'audit') {
+    const m = loadManifest(slice);
+    noSymlinks(root, `.lanes/${slice}`);
+    const wt = wtPath(slice);
+    const head = git(['rev-parse', 'HEAD'], wt).trim();
+    const problems = [];
+    if (head !== m.base) problems.push(`HEAD moved: ${m.base} -> ${head}`);
+    const committed = git(['diff', '--name-only', '-z', '--no-renames', m.base, head, '--'], wt).split('\0').filter(Boolean);
+    const changed = [...new Set([...statusPaths(wt), ...committed])];
+    const outOfScope = changed.filter((file) => !matches(m.files, file));
+    const touchedProtected = changed.filter((file) => matches(m.protect, file));
+    if (outOfScope.length) problems.push(`out of scope: ${outOfScope.join(', ')}`);
+    if (touchedProtected.length) problems.push(`protected paths changed: ${touchedProtected.join(', ')}`);
+    console.log(`[lane] audit ${slice}: ${changed.length} changed paths`);
+    for (const file of changed) console.log(`  ${JSON.stringify(file)}`);
+    if (problems.length) fail(problems.join('\n[lane] FAIL: '));
+    console.log('[lane] PASS: HEAD unchanged, all changes in scope, protected paths untouched');
+  }
+
+  if (cmd === 'list') {
+    const ms = manifests();
+    if (!ms.length) console.log('[lane] no active lanes');
+    for (const m of ms) console.log(`${m.slice}  @${m.base.slice(0, 10)}  ${m.createdAt}  [${m.files.join(', ')}]`);
+  }
+
+  if (cmd === 'drop') {
+    const m = loadManifest(slice);
+    noSymlinks(root, `.lanes/${slice}`);
+    const wt = wtPath(slice);
+    if (!force) {
+      if (statusPaths(wt, true).length) fail('worktree is dirty (including ignored files); use --force to discard');
+      const mainHead = git(['rev-parse', 'HEAD'], root).trim();
+      const heads = [git(['rev-parse', 'HEAD'], wt).trim(), git(['rev-parse', '--verify', `refs/heads/${m.branch}`], root).trim()];
+      for (const head of new Set(heads)) {
+        try { git(['merge-base', '--is-ancestor', head, mainHead], root); }
+        catch { fail('lane has commits not merged into main worktree HEAD; use --force to discard'); }
+      }
+    }
+    git(['worktree', 'remove', ...(force ? ['--force'] : []), wt], root);
+    // -D is safe here only after the explicit ancestry checks, or with --force.
+    git(['branch', '-D', m.branch], root);
+    fs.unlinkSync(manifestPath(slice));
+    console.log(`[lane] dropped: ${slice}`);
   }
 }
 
-if (cmd === 'drop') {
-  const slice = argv.shift();
-  const m = loadManifest(slice);
-  try { git(['worktree', 'remove', '--force', wtPath(slice)], root); } catch { /* Windows 句柄残留或已手动删,走下面兜底 */ }
-  // Windows 下 git 删目录常因文件句柄失败:fs 重试兜底 + prune 清注册表
-  if (fs.existsSync(wtPath(slice))) fs.rmSync(wtPath(slice), { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-  try { git(['worktree', 'prune'], root); } catch { /* ignore */ }
-  try { git(['branch', '-D', m.branch], root); } catch { /* 分支可能已合并删除 */ }
-  fs.rmSync(manifestPath(slice), { force: true });
-  if (fs.existsSync(wtPath(slice))) die(`worktree 目录删不掉(句柄被占用?): ${wtPath(slice)} — 关掉占用进程后重跑 drop`);
-  console.log(`[lane] dropped: ${slice}`);
-}
+try { main(); }
+catch (error) { console.error(`[lane] FAIL: ${error.message}`); process.exitCode = 1; }

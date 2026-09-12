@@ -1,116 +1,71 @@
 ---
 name: dispatch
-description: 多模型派单工作流:Claude 当架构师/监工/验收官,把施工派给 Codex(后端/复杂逻辑)与 Kimi(杂事/机械活)。凡是要派活、派单、分工、并行开发、多 agent 协作、让 Codex/Kimi 干活、开 lane、验收 worker 产出时,必须先加载本 skill。
+description: GPT/Codex 主控的多模型派单工作流。用于把边界明确的独立任务交给 Codex 或 Kimi CLI、管理并行 worktree、收取执行证据和验收 worker 产出。共享状态、连续决策及小改动由主控直接完成。
 ---
 
-# dispatch — 架构归 Claude,施工归 worker
+# Dispatch: GPT 主控，Codex / Kimi 施工
 
-角色铁律:**你(Claude)只做架构、拆单、派活、监工、验收;前端/UI 亲自写;其余施工派出去。**
-worker 的「完成」只是「待验收」;worker 的一切声明是传闻证据,结论只能由你跑命令得出。
+你是当前 GPT 主控，通常运行在 Codex App 或 Codex CLI 中；Codex worker 是另一段独立 CLI 进程，不是当前会话的别名。不依赖 Claude Code、其插件或常驻 broker。
 
-## 1. 自适应分级(先定档,再动手)
+用户当前指令和项目 canonical `AGENTS.md` 优先。只在存在独立工作流且委派能节省时间或提高质量时派单。先读代码，自己处理当前关键路径；不要把下一步立即依赖的工作派出去后空等。worker 的完成报告只是待验收材料。
 
-| 档 | 触发条件 | 流程 |
-|----|---------|------|
-| **L0 直做** | ≤~30 行 / 单文件修补 / 紧急修复 / 前端(路由表归 Claude 的域) | 自己写,不派单。仍守「提交前绿条跑在即将提交的代码上」 |
-| **L1 轻派单** | 单域、边界明确、无并行需求 | 工单(含 PHASE 0 + 原始证据)→ 单 worker 在主树干活 → 验收。不冻 gates 不开 lane,但派前主树必须干净 |
-| **L2 重派单** | 需并行 / 或触及 schema、API 契约、持久化、安全 | gates 前置冻结 → worktree lane(每 worker 一个)→ 触碰集对账 → 高风险加跨模型评审 |
+## 分级和路由
 
-拿不准时:并行=L2;单干但改动大=L1 并口头声明验收命令;犹豫要不要 gates 的,就是要。
+| 档位 | 场景 | 做法 |
+| --- | --- | --- |
+| L0 直做 | 小修、共享状态、连续决策、紧急修复、前端/UI | 主控直接完成，做与风险相称的验证 |
+| L1 轻派单 | 单域、边界明确的独立任务 | 干净主树 + 自包含工单 + 单 worker + 主控验收 |
+| L2 隔离派单 | 多 worker 并行，或派出的任务涉及 schema/API/持久化/安全 | 先冻结验收 gates，再分配互不重叠的 worktree lane |
 
-## 2. 路由(默认表 + 项目覆盖)
+默认路由：后端/复杂逻辑/长程排障给 Codex；测试补写/文档同步/机械修改/读码报告给 Kimi；前端/UI 与浏览器验收由主控处理。跨端任务先冻结接口再拆单。项目 `AGENTS.md` 的“派单路由”可以覆盖这些默认值。
 
-**先查项目 CLAUDE.md 是否有「## 派单路由」节;有则以项目为准。** 默认:
+不强制具体 GPT 型号。主控沿用当前会话模型；worker 默认沿用各自 CLI 配置，仅按用户明确要求传 `--model`。Codex 的 `--effort high|xhigh` 仅在任务确需时设置。
 
-| 任务域 | 谁干 | 备注 |
-|--------|------|------|
-| 后端 / 复杂逻辑 / 长程 debug / 大重构 | **Codex**(xhigh) | 「计划明确只差执行」是其强项 |
-| 测试补写 / 文档同步 / 机械批量改 / 全仓摸底读码 | **Kimi** | 便宜、验收成本低;大规模读码出报告尤其合算 |
-| 前端 / UI / 小程序 / 一切需浏览器或截图验收的 | **Claude 亲自** | 派出去的往返成本高于自己写 |
-| 跨端契约(DTO / 接口变更) | Claude **先冻结契约**再分头派 | 前端绝不能凭空发明后端 API |
-| 独立第三方复核(高风险 diff) | 交给**没写这份代码**的那个模型 | 评审者一旦落笔即被污染,评审单必须只读 |
+## 工单
 
-## 3. 工单模板(两家通用,自包含——worker 看不到你的对话)
+每单使用 [工单模板](references/work-order.md)，补全目标及原因、钉死项、允许修改路径、文件级改动、验收命令、PHASE 0 现实核对、原始证据交付格式。worker 不能假定看得到主会话。
 
-```
-【目标】做什么 + 为什么(给理由,不只给指令)
-【钉死项】数据结构 / 接口签名 / 禁改清单
-【文件触碰集】只许改这些(与 lane manifest 一致)
-【改动清单】文件级的预期改动 + 已知陷阱
-【验收命令】逐条列出(L2 时指向已冻结的 docs/gates/<slice>.md)
-【PHASE 0 异议】动工前必须先核对本工单与代码现实的冲突,引用具体文件;
-  没有冲突也要列出查证了什么。沉默服从记为缺陷。
-【交付格式】只准原始证据:命令+完整输出(或输出文件路径)、diffstat、改动文件清单。
-  禁止「已完成 / 测试通过」类结论句。
-【边界】自检 typecheck+test;禁一切 git 写操作;禁碰触碰集外文件;不许扩大范围重构。
-```
+工单和日志放在目标仓库外，避免污染 L1 的干净基线或触碰集。worker 禁止自行 stage/commit/merge/push、切换分支、越界重构及递归派单。遇到工单与代码冲突，先报告具体文件与影响，不自行扩大范围。
 
-## 4. 派单机制
+## 脚本位置
 
-### Codex lane(codex-companion 插件)
+安装后的本 `SKILL.md` 同级有 `scripts/`。用本次实际加载的 skill 目录确定 `SKILL_DIR`，不要假定用户家目录或插件版本。默认安装位置是 `$HOME/.agents/skills/dispatch`；自定义安装位置以安装输出为准。仓库源码中的脚本位于仓库根 `scripts/`。
 
-```
-node "C:\Users\nigo\.claude\plugins\cache\openai-codex\codex\1.0.6\scripts\codex-companion.mjs" \
-  task --background --write --effort xhigh --fresh "<工单>"   # 派(一律 --background,禁前台等待)
-  status --all                                                # 盯
-  result <job-id>                                             # 收
-  task --resume-last "<缺陷清单>"                             # 打回重做
-  adversarial-review --background [focus]                     # 对抗式审查
+下列命令中的 `SCRIPTS` 表示脚本目录；`PROJECT` 和 `ORDER` 表示项目与工单的绝对路径。
+
+```bash
+node "$SCRIPTS/dispatch.mjs" start --worker codex --cwd "$PROJECT" \
+  --prompt-file "$ORDER" --sandbox workspace-write
+node "$SCRIPTS/dispatch.mjs" start --worker kimi --cwd "$PROJECT" \
+  --prompt-file "$ORDER"
+node "$SCRIPTS/dispatch.mjs" status "$JOB_ID"
+node "$SCRIPTS/dispatch.mjs" wait "$JOB_ID" --poll 2 --timeout 300
+node "$SCRIPTS/dispatch.mjs" result "$JOB_ID"
+node "$SCRIPTS/dispatch.mjs" retry "$JOB_ID" --prompt-file "$CORRECTIONS"
+node "$SCRIPTS/dispatch.mjs" cancel "$JOB_ID"
 ```
 
-- 等终态一律 `node "C:\Users\nigo\.claude\codex-wait.mjs" <job-id> [轮询秒]`(Bash + run_in_background)。
-  **绝不 grep/awk 解析 status 文本**——完成任务会换表格挪位置,过滤器静默失灵,表现和「卡住」一模一样。
-- 在 lane 里跑:工单开头注明工作目录为该 lane 的 worktree 绝对路径。
-- Windows 已知事实:Codex 沙箱 helper 起不来(openai/codex #28248),两处规避缺一不可——
-  ① 全局 config `sandbox_mode = "danger-full-access"`;② 插件补丁(codex-companion.mjs 两处 +
-  lib/codex.mjs 一处写死 sandbox 值改 "danger-full-access";**插件升级会覆盖,升级后 grep sandbox 三处重打**)。
-  改完插件必须杀 `app-server-broker.mjs` 常驻进程,否则内存旧代码,任务卡死在 Starting thread。
-- quirk:任务未完时 `result` 报「No job found」= 还没完,不是丢了;同仓多任务排队串行。
-- Codex 实际无沙箱 → 工单里的禁令全靠事后对账(lane audit / git status),**派前工作树必须干净**。
+`start` 自动后台运行并返回 JSON job ID。同一实际工作目录只允许一个活动作业；并行使用不同 lane。`wait --timeout` 只结束等待，不取消作业；`start --timeout` 才是可选的执行总时限。无输出不等于卡死，结合 `status.idleSeconds`、原始日志与进程状态判断，再按需取消。
 
-### Kimi lane(kimi CLI,≥0.38)
+`retry` 为指定 job 创建新会话，带入原工单、先前报告与缺陷清单，沿用 worker、目录及模型配置。它不使用含混的 `--resume-last` 或 Kimi `-c`，也不恢复隐藏的完整会话。先前代码改动仍留在工作目录。返工超过两轮，重新核对拆单边界。
 
-```
-kimi -p "<工单>"            # 非交互派单;-p 会自动执行工具调用,禁配 --auto/-y
-kimi -c -p "<缺陷清单>"     # 打回重做:-c 按工作目录续会话 → 每个 lane 目录天然独立会话
-```
+Codex 默认 `read-only`，写代码明确指定 `workspace-write`。Kimi 的 prompt 模式没有本脚本可提供的等效沙箱；工单范围与事后审计不能称作系统级权限隔离。`succeeded` 只代表 CLI 正常退出且有报告，不代表项目验收通过。
 
-- 后台跑:Bash 工具 `run_in_background` + 输出重定向到 lane 内 `_report.md`,完成自动收到通知。
-- 在 lane 的 worktree 目录里启动(cwd 即隔离边界 + 会话键)。
+## L2 Worktree 与 Gates
 
-### 卡死判定(两家通用)
+1. 把精确验收命令及预期结果写进 `docs/gates/<slice>.md`，由主控提交。主树必须干净。
+2. 在主仓库运行 `node "$SCRIPTS/lane.mjs" new <slice> <允许路径>...`。仅接受精确文件/目录，不支持 glob。脚本建立 `.lanes/<slice>` 和 `lane/<slice>` 分支，拒绝重叠范围。主控串行建好所有 lane，再并行启动 worker；不要并发调用 `new`。
+3. 用 lane 的绝对路径作为 `--cwd` 派单。不同 worker 不得共享写入范围。
+4. 完工后运行 `node "$SCRIPTS/lane.mjs" audit <slice>`：核对 HEAD 未移动、改动都在范围内、`docs/gates/` 未碰。
+5. 主控读 diff、按 gates 验收；通过后在 lane 内提交，回主树合并并运行必要的集成验证。没有新改动/新失败/遗留疑点，不反复扩大测试。
+6. `node "$SCRIPTS/lane.mjs" drop <slice>` 清理已合并 lane。弃单用 `drop <slice> --force` 会丢弃该 lane 的改动和未合并分支，执行前确认不再需要这些产出。
 
-输出文件 **5 分钟**不增长 → 疑似卡死;**15 分钟** → 杀该子进程(不是杀整个任务),打回或弃 lane。
-lane 坏了优先 `drop` + 重派,别救援式追加 prompt——lane 按构造是便宜的。
+lane 是工作目录隔离和 Git 状态审计，不是权限沙箱，也不是不可篡改的审计系统。跨 lane 冲突首先检查拆单是否错误，不让 worker 自行改其他 lane 来解决。
 
-## 5. worktree lane(L2 强制力层)
+## 验收
 
-```
-node "C:\Users\nigo\.claude\lane.mjs" new <slice> <文件/目录>... [--base <ref>] [--protect <path>]
-node "C:\Users\nigo\.claude\lane.mjs" audit <slice>    # HEAD 未动 + 全在声明集 + gates 未碰;FAIL 即 exit 1
-node "C:\Users\nigo\.claude\lane.mjs" list
-node "C:\Users\nigo\.claude\lane.mjs" drop <slice>
-```
-
-- worktree 在 `<repo>/.lanes/<slice>`,分支 `lane/<slice>`,自动进 .git/info/exclude。
-- **并行前提:各 lane 触碰集互不相交。** 合并冲突 = 拆单缺陷 → 杀冲突 lane 重拆,不现场调解。
-- 合并流程(audit PASS 后,全归你):lane 目录里逐行读 diff → 你 commit 到 lane 分支 →
-  回主树 merge → 合并后在主树再跑一遍 gates(集成冒烟)→ `drop`。
-- worker 永不 commit(audit 的 HEAD 检查兜底)。
-
-## 6. gates 前置冻结(L2)
-
-派单**前**把验收写成 `docs/gates/<slice>.md` 并 commit:每条 = 精确命令 + 预期输出/阈值。
-- 判分权不给 worker:工单只说「跑这些命令并贴原始输出」。
-- worker 改 `docs/gates/` = 该 lane 自动 FAIL(lane.mjs 默认保护)。
-- 验收时照 gates 逐条自跑打钩,**引用原文判,不凭记忆复述**。
-- gate 全过是必要条件不是充分条件:仍要对着 spec 意图读 diff——迭代对抗可见测试是已知作弊向量。
-
-## 7. 验收清单(每单必走)
-
-1. lane audit PASS(L2)/ git status 对账(L1)。
-2. gates / 验收命令逐条自跑,读原始输出。
-3. diff 逐行读;关键断言用 `node "C:\Users\nigo\.claude\mutate.mjs"` 变异看红(禁手写 sed + git checkout 还原)。
-4. 高风险 diff(schema/API/持久化/安全):派**另一家**模型做只读对抗评审再判。
-5. 判定:PASS 合并 / 打回(resume + 缺陷清单)/ 弃 lane 重拆。打回超过 2 轮 = 拆单缺陷,回炉重写工单。
-6. 提交前在**即将提交的那份代码**上重跑绿条,再 commit。
+- L1 用 `git status` 对账，L2 用 `lane audit`。主控对着 spec 和实际 diff 判断意图是否实现。
+- 验收证据保留命令、原始输出、改动路径；不要只引用 worker 的“测试通过”。
+- 高风险 diff 如需独立复核，交给未参与实现的 worker，只读；不同会话不自动等于不同模型。
+- 有必要检查关键断言时使用 `mutate.mjs`：目标文件先保持已提交且干净，脚本先运行绿色基线，再施加变异并恢复原始内容。未匹配或测试仍绿返回非零。基线失败不能被当成“成功杀死变异”。
+- 所提交的代码应是已经验证的那份。主控拥有提交、合并和最终验收权；此 skill 不自行授权推送或发布。
